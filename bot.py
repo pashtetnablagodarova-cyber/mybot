@@ -1,8 +1,7 @@
-import asyncio
+import os
 import random
 import time
-from os import getenv
-import aiosqlite
+import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery,
@@ -10,60 +9,62 @@ from aiogram.types import (
     KeyboardButton, ReplyKeyboardMarkup
 )
 
-BOT_TOKEN = getenv("BOT_TOKEN", "8865006313:AAH6eQwsM1IufGWyo2_58MX_L2wVH7snknk")
-DB = "/data/game.db"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8865006313:AAH6eQwsM1IufGWyo2_58MX_L2wVH7snknk")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 CHANNEL_URL = "https://t.me/randomkanews"
 ADMIN_ID = 8006016784
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+db_pool = None
 broadcast_state = {"waiting": False}
 
 
 async def init_db():
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("""
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 name TEXT,
-                coins INTEGER DEFAULT 0,
-                xp INTEGER DEFAULT 0,
+                coins BIGINT DEFAULT 0,
+                xp BIGINT DEFAULT 0,
                 cases_opened INTEGER DEFAULT 0,
-                last_bonus INTEGER DEFAULT 0,
+                last_bonus BIGINT DEFAULT 0,
                 inventory TEXT DEFAULT '',
-                last_hat INTEGER DEFAULT 0,
+                last_hat BIGINT DEFAULT 0,
                 hat_count INTEGER DEFAULT 0,
-                last_dealer INTEGER DEFAULT 0,
+                last_dealer BIGINT DEFAULT 0,
                 dealer_count INTEGER DEFAULT 0,
                 banned INTEGER DEFAULT 0,
                 streak INTEGER DEFAULT 0,
-                last_streak INTEGER DEFAULT 0,
+                last_streak BIGINT DEFAULT 0,
                 streak_total INTEGER DEFAULT 0,
                 crystals INTEGER DEFAULT 0,
-                season_xp INTEGER DEFAULT 0
+                season_xp BIGINT DEFAULT 0
             )
         """)
-        await db.commit()
 
 
 async def get_user(user_id, name="Игрок"):
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
         if not row:
-            await db.execute("INSERT INTO users (user_id, name) VALUES (?, ?)", (user_id, name))
-            await db.commit()
-            cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-            row = await cur.fetchone()
+            await conn.execute(
+                "INSERT INTO users (user_id, name) VALUES ($1, $2)",
+                user_id, name
+            )
+            row = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
         return row
 
 
 async def update_user(user_id, **kwargs):
-    async with aiosqlite.connect(DB) as db:
-        for k, v in kwargs.items():
-            await db.execute(f"UPDATE users SET {k}=? WHERE user_id=?", (v, user_id))
-        await db.commit()
+    async with db_pool.acquire() as conn:
+        sets = ", ".join([f"{k}=${i+2}" for i, k in enumerate(kwargs.keys())])
+        values = list(kwargs.values())
+        await conn.execute(f"UPDATE users SET {sets} WHERE user_id=$1", user_id, *values)
 
 
 def level_from_xp(xp):
@@ -76,15 +77,8 @@ def level_from_xp(xp):
 
 
 def streak_reward(day):
-    rewards = {
-        1: (150, 0),
-        2: (250, 0),
-        3: (400, 0),
-        4: (600, 0),
-        5: (900, 0),
-        6: (1300, 0),
-        7: (2000, 0),
-    }
+    rewards = {1: (150, 0), 2: (250, 0), 3: (400, 0), 4: (600, 0),
+               5: (900, 0), 6: (1300, 0), 7: (2000, 0)}
     return rewards.get(day, (0, 0))
 
 
@@ -104,12 +98,11 @@ def is_admin(user_id):
     return user_id == ADMIN_ID
 
 
-# ========== /start ==========
 @dp.message(F.text == "/start")
 async def start(message: Message):
     await get_user(message.from_user.id, message.from_user.first_name or "Игрок")
     u = await get_user(message.from_user.id)
-    if u[11] == 1:
+    if u["banned"] == 1:
         await message.answer("🚫 Ты забанен.")
         return
     await message.answer(
@@ -119,37 +112,36 @@ async def start(message: Message):
     )
 
 
-# ========== Я ==========
 @dp.message(F.text == "👤 Я")
 async def me(message: Message):
     u = await get_user(message.from_user.id, message.from_user.first_name or "Игрок")
-    _, name, coins, xp, cases, _, inv, _, _, _, _, banned, streak, _, streak_total, crystals, season_xp = u
-    if banned:
+    if u["banned"] == 1:
         await message.answer("🚫 Ты забанен.")
         return
-    lvl, cur_total, need = level_from_xp(xp)
-    inv_list = [i for i in inv.split(",") if i]
+    lvl, cur_total, need = level_from_xp(u["xp"])
+    inv_list = [i for i in u["inventory"].split(",") if i]
 
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM users WHERE coins > ? AND banned=0", (coins,))
-        place = (await cur.fetchone())[0] + 1
+    async with db_pool.acquire() as conn:
+        place = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE coins > $1 AND banned=0", u["coins"]
+        )
+    place += 1
 
     text = (
-        f"👤 <b>{name}</b>\n\n"
+        f"👤 <b>{u['name']}</b>\n\n"
         f"🎚 Уровень: <b>{lvl}</b>\n"
-        f"✨ Опыт: {xp - cur_total} / {need}\n"
-        f"💰 Баланс: <b>{coins}</b> фокусов\n"
-        f"💎 Кристаллы: <b>{crystals}</b>\n"
+        f"✨ Опыт: {u['xp'] - cur_total} / {need}\n"
+        f"💰 Баланс: <b>{u['coins']}</b> фокусов\n"
+        f"💎 Кристаллы: <b>{u['crystals']}</b>\n"
         f"🏅 Место в топе: <b>#{place}</b>\n"
-        f"🔥 Стрик: <b>{streak}</b> дней (всего {streak_total})\n"
-        f"📅 Сезонный XP: <b>{season_xp}</b>\n"
-        f"🎁 Открыто кейсов: {cases}\n\n"
+        f"🔥 Стрик: <b>{u['streak']}</b> дней (всего {u['streak_total']})\n"
+        f"📅 Сезонный XP: <b>{u['season_xp']}</b>\n"
+        f"🎁 Открыто кейсов: {u['cases_opened']}\n\n"
         f"🎒 Инвентарь: {', '.join(inv_list) if inv_list else 'пусто'}"
     )
     await message.answer(text, parse_mode="HTML")
 
 
-# ========== Топ ==========
 @dp.message(F.text == "🏆 Топ")
 async def top(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -161,22 +153,23 @@ async def top(message: Message):
 
 @dp.callback_query(F.data == "top_all")
 async def top_all(call: CallbackQuery):
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("SELECT name, coins, xp FROM users WHERE banned=0 ORDER BY coins DESC LIMIT 10")
-        rows = await cur.fetchall()
-
-    text = "🌍 <b>Топ за всё время (по балансу):</b>\n\n"
-    for i, (name, coins, xp) in enumerate(rows, 1):
-        lvl, _, _ = level_from_xp(xp)
-        text += f"{i}. {name} — 💰{coins} | 🎚{lvl} lvl\n"
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT name, coins, xp FROM users WHERE banned=0 ORDER BY coins DESC LIMIT 10"
+        )
+    text = "🌍 <b>Топ за всё время:</b>\n\n"
+    for i, r in enumerate(rows, 1):
+        lvl, _, _ = level_from_xp(r["xp"])
+        text += f"{i}. {r['name']} — 💰{r['coins']} | 🎚{lvl} lvl\n"
 
     text += "\n🎚 <b>Топ по уровню:</b>\n\n"
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("SELECT name, coins, xp FROM users WHERE banned=0 ORDER BY xp DESC LIMIT 10")
-        rows = await cur.fetchall()
-    for i, (name, coins, xp) in enumerate(rows, 1):
-        lvl, _, _ = level_from_xp(xp)
-        text += f"{i}. {name} — 🎚{lvl} lvl | 💰{coins}\n"
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT name, coins, xp FROM users WHERE banned=0 ORDER BY xp DESC LIMIT 10"
+        )
+    for i, r in enumerate(rows, 1):
+        lvl, _, _ = level_from_xp(r["xp"])
+        text += f"{i}. {r['name']} — 🎚{lvl} lvl | 💰{r['coins']}\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌍 За всё время", callback_data="top_all")],
@@ -188,13 +181,13 @@ async def top_all(call: CallbackQuery):
 
 @dp.callback_query(F.data == "top_season")
 async def top_season(call: CallbackQuery):
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("SELECT name, season_xp FROM users WHERE banned=0 ORDER BY season_xp DESC LIMIT 10")
-        rows = await cur.fetchall()
-
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT name, season_xp FROM users WHERE banned=0 ORDER BY season_xp DESC LIMIT 10"
+        )
     text = "📅 <b>Топ сезона (бета):</b>\n\n"
-    for i, (name, season_xp) in enumerate(rows, 1):
-        text += f"{i}. {name} — ⭐ {season_xp}\n"
+    for i, r in enumerate(rows, 1):
+        text += f"{i}. {r['name']} — ⭐ {r['season_xp']}\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌍 За всё время", callback_data="top_all")],
@@ -204,11 +197,10 @@ async def top_season(call: CallbackQuery):
     await call.answer()
 
 
-# ========== Кейсы ==========
 @dp.message(F.text == "🎁 Кейсы")
 async def cases(message: Message):
     u = await get_user(message.from_user.id)
-    if u[11] == 1:
+    if u["banned"] == 1:
         await message.answer("🚫 Ты забанен.")
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -221,17 +213,15 @@ async def cases(message: Message):
 @dp.callback_query(F.data == "case1")
 async def case1(call: CallbackQuery):
     u = await get_user(call.from_user.id)
-    if u[11] == 1:
+    if u["banned"] == 1:
         await call.answer("🚫 Ты забанен.", show_alert=True)
         return
-    coins, xp, cases_opened, inv = u[2], u[3], u[4], u[6]
+    coins, xp = u["coins"], u["xp"]
     if coins < 500:
         await call.answer("Недостаточно монет!", show_alert=True)
         return
-
     roll = random.randint(1, 100)
-    inv_list = [i for i in inv.split(",") if i]
-
+    inv_list = [i for i in u["inventory"].split(",") if i]
     if roll <= 40:
         coins += 300 - 500
         result = "🪙 +300 монет"
@@ -252,7 +242,8 @@ async def case1(call: CallbackQuery):
         result = "🔮 Малый амулет (3000 💰)"
 
     await update_user(call.from_user.id, coins=coins, xp=xp,
-                      cases_opened=cases_opened + 1, inventory=",".join(inv_list))
+                      cases_opened=u["cases_opened"] + 1,
+                      inventory=",".join(inv_list))
     await call.message.edit_text(f"🎁 Кейс новичка открыт!\n\n{result}\n\n💰 Баланс: {coins}")
     await call.answer()
 
@@ -260,17 +251,15 @@ async def case1(call: CallbackQuery):
 @dp.callback_query(F.data == "case2")
 async def case2(call: CallbackQuery):
     u = await get_user(call.from_user.id)
-    if u[11] == 1:
+    if u["banned"] == 1:
         await call.answer("🚫 Ты забанен.", show_alert=True)
         return
-    coins, xp, cases_opened, inv = u[2], u[3], u[4], u[6]
+    coins, xp = u["coins"], u["xp"]
     if coins < 2500:
         await call.answer("Недостаточно монет!", show_alert=True)
         return
-
     roll = random.randint(1, 100)
-    inv_list = [i for i in inv.split(",") if i]
-
+    inv_list = [i for i in u["inventory"].split(",") if i]
     if roll <= 30:
         coins += 2000 - 2500
         result = "🪙 +2000 монет"
@@ -300,94 +289,77 @@ async def case2(call: CallbackQuery):
         result = "💎 Магический кристалл (15000 💰)"
 
     await update_user(call.from_user.id, coins=coins, xp=xp,
-                      cases_opened=cases_opened + 1, inventory=",".join(inv_list))
+                      cases_opened=u["cases_opened"] + 1,
+                      inventory=",".join(inv_list))
     await call.message.edit_text(f"🎁 Кейс фокусника открыт!\n\n{result}\n\n💰 Баланс: {coins}")
     await call.answer()
 
 
-# ========== Стрик ==========
 @dp.message(F.text == "🔥 Стрик")
 async def streak(message: Message):
     u = await get_user(message.from_user.id)
-    if u[11] == 1:
+    if u["banned"] == 1:
         await message.answer("🚫 Ты забанен.")
         return
-
-    coins, xp = u[2], u[3]
-    streak_val, last_streak, streak_total, crystals = u[12], u[13], u[14], u[15]
     now = int(time.time())
     today = now // 86400
-    last_day = last_streak // 86400 if last_streak else 0
+    last_day = u["last_streak"] // 86400 if u["last_streak"] else 0
 
     if last_day == today:
         await message.answer("⏳ Ты уже получал награду сегодня. Возвращайся завтра!")
         return
 
-    if last_day == today - 1:
-        streak_val += 1
-    else:
-        streak_val = 1
-
-    streak_total += 1
+    streak_val = u["streak"] + 1 if last_day == today - 1 else 1
+    streak_total = u["streak_total"] + 1
     day = ((streak_val - 1) % 7) + 1
     reward_coins, reward_xp = streak_reward(day)
-
+    crystals = u["crystals"]
     bonus_text = ""
     if streak_total == 30:
         reward_coins += 10000
         crystals += 1
-        bonus_text = "\n\n🎉 <b>30 дней подряд!</b>\n💰 +10 000 монет\n💎 +1 кристалл"
+        bonus_text = "\n\n🎉 <b>30 дней!</b>\n💰 +10 000\n💎 +1 кристалл"
     elif streak_total == 100:
         reward_coins += 50000
         crystals += 3
-        bonus_text = "\n\n🎉 <b>100 дней подряд!</b>\n💰 +50 000 монет\n💎 +3 кристалла"
+        bonus_text = "\n\n🎉 <b>100 дней!</b>\n💰 +50 000\n💎 +3 кристалла"
     elif streak_total == 365:
         reward_coins += 500000
         crystals += 10
-        bonus_text = "\n\n🎉 <b>Год подряд!</b>\n💰 +500 000 монет\n💎 +10 кристаллов"
+        bonus_text = "\n\n🎉 <b>Год!</b>\n💰 +500 000\n💎 +10 кристаллов"
 
     item_text = ""
+    inv_list = [i for i in u["inventory"].split(",") if i]
     if day == 7:
         item = random.choice(["🃏 Карта фокусника", "🎩 Цилиндр", "🪄 Палочка волшебника"])
-        inv = [i for i in u[6].split(",") if i]
-        inv.append(item)
-        await update_user(message.from_user.id, inventory=",".join(inv))
+        inv_list.append(item)
         item_text = f"\n🎁 Предмет: {item}"
 
-    await update_user(
-        message.from_user.id,
-        coins=coins + reward_coins,
-        xp=xp + reward_xp,
-        streak=streak_val,
-        last_streak=now,
-        streak_total=streak_total,
-        crystals=crystals
-    )
-
+    await update_user(message.from_user.id,
+                      coins=u["coins"] + reward_coins,
+                      xp=u["xp"] + reward_xp,
+                      streak=streak_val, last_streak=now,
+                      streak_total=streak_total, crystals=crystals,
+                      inventory=",".join(inv_list))
     await message.answer(
         f"🔥 <b>Стрик: день {streak_val}</b>\n\n"
-        f"💰 +{reward_coins} монет\n"
-        f"✨ +{reward_xp} опыта"
-        f"{item_text}"
-        f"{bonus_text}",
-        parse_mode="HTML"
+        f"💰 +{reward_coins} монет\n✨ +{reward_xp} опыта"
+        f"{item_text}{bonus_text}", parse_mode="HTML"
     )
 
 
-# ========== Новости ==========
 @dp.message(F.text == "📰 Новости")
 async def news(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📰 Перейти в канал", url=CHANNEL_URL)]
     ])
-    await message.answer("📰 Все новости и обновления — в нашем канале:", reply_markup=kb)
+    await message.answer("📰 Все новости — в канале:", reply_markup=kb)
 
 
-# ========== Заработать ==========
 @dp.message(F.text == "💰 Заработать")
 async def earn(message: Message):
     u = await get_user(message.from_user.id)
-    if u[11] == 1:
+    if u["banned"] == 1:
         await message.answer("🚫 Ты забанен.")
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -401,15 +373,18 @@ async def earn(message: Message):
 
 
 guess_numbers = {}
+hat_games = {}
+roulette_state = {}
+upgrade_state = {}
 
 
 @dp.callback_query(F.data == "guess")
 async def guess_start(call: CallbackQuery):
     u = await get_user(call.from_user.id)
-    if u[2] < 1:
+    if u["coins"] < 1:
         await call.answer("Нужна хотя бы 1 монета!", show_alert=True)
         return
-    await update_user(call.from_user.id, coins=u[2] - 1)
+    await update_user(call.from_user.id, coins=u["coins"] - 1)
     guess_numbers[call.from_user.id] = random.randint(1, 5)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=str(i), callback_data=f"gnum_{i}") for i in range(1, 6)],
@@ -423,17 +398,14 @@ async def guess_answer(call: CallbackQuery):
     n = int(call.data.split("_")[1])
     target = guess_numbers.get(call.from_user.id)
     u = await get_user(call.from_user.id)
-
     if target is None:
         await call.answer("Игра не найдена", show_alert=True)
         return
-
     if n == target:
-        await update_user(call.from_user.id, coins=u[2] + 5)
+        await update_user(call.from_user.id, coins=u["coins"] + 5)
         text = f"🎉 Угадал! Число {target}.\n💰 +5 монет"
     else:
         text = f"😢 Не угадал. Было {target}."
-
     guess_numbers.pop(call.from_user.id, None)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎲 Играть ещё (1 💰)", callback_data="guess")],
@@ -442,25 +414,19 @@ async def guess_answer(call: CallbackQuery):
     await call.answer()
 
 
-hat_games = {}
-
-
 @dp.callback_query(F.data == "hat")
 async def hat_start(call: CallbackQuery):
     u = await get_user(call.from_user.id)
     now = int(time.time())
-    hat_count = u[8]
-
-    if now - u[7] > 3600:
+    hat_count = u["hat_count"]
+    if now - u["last_hat"] > 3600:
         await update_user(call.from_user.id, hat_count=0, last_hat=now)
         hat_count = 0
-
     if hat_count >= 5:
-        left = 3600 - (now - u[7])
+        left = 3600 - (now - u["last_hat"])
         m = left // 60
         await call.answer(f"Лимит: 5 раз/час. Жди {m} мин", show_alert=True)
         return
-
     hat_games[call.from_user.id] = random.randint(0, 2)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎩 1", callback_data="hat_0"),
@@ -476,18 +442,15 @@ async def hat_answer(call: CallbackQuery):
     choice = int(call.data.split("_")[1])
     target = hat_games.get(call.from_user.id)
     u = await get_user(call.from_user.id)
-
     if target is None:
         await call.answer("Игра не найдена", show_alert=True)
         return
-
     if choice == target:
-        await update_user(call.from_user.id, coins=u[2] + 5, hat_count=u[8] + 1)
+        await update_user(call.from_user.id, coins=u["coins"] + 5, hat_count=u["hat_count"] + 1)
         text = "🎉 Угадал! +5 монет"
     else:
-        await update_user(call.from_user.id, hat_count=u[8] + 1)
+        await update_user(call.from_user.id, hat_count=u["hat_count"] + 1)
         text = f"😢 Не угадал. Шарик был под шляпой {target + 1}."
-
     hat_games.pop(call.from_user.id, None)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎩 Ещё раз", callback_data="hat")],
@@ -503,38 +466,30 @@ dealer_cards = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"
 async def dealer_start(call: CallbackQuery):
     u = await get_user(call.from_user.id)
     now = int(time.time())
-    dealer_count = u[10]
-
-    if now - u[9] > 86400:
+    dealer_count = u["dealer_count"]
+    if now - u["last_dealer"] > 86400:
         await update_user(call.from_user.id, dealer_count=0, last_dealer=now)
         dealer_count = 0
-
     if dealer_count >= 3:
-        await call.answer("Лимит: 3 раза/день. Приходи завтра!", show_alert=True)
+        await call.answer("Лимит: 3 раза/день.", show_alert=True)
         return
-
     player = random.choice(dealer_cards)
     dealer = random.choice(dealer_cards)
     values = {c: i for i, c in enumerate(dealer_cards)}
-
     if values[player] > values[dealer]:
-        await update_user(call.from_user.id, coins=u[2] + 10, dealer_count=u[10] + 1)
+        await update_user(call.from_user.id, coins=u["coins"] + 10, dealer_count=u["dealer_count"] + 1)
         text = f"🃏 Ты: {player} | Дилер: {dealer}\n\n🎉 Победа! +10 монет"
     elif values[player] < values[dealer]:
-        await update_user(call.from_user.id, dealer_count=u[10] + 1)
+        await update_user(call.from_user.id, dealer_count=u["dealer_count"] + 1)
         text = f"🃏 Ты: {player} | Дилер: {dealer}\n\n😢 Дилер выиграл."
     else:
-        await update_user(call.from_user.id, dealer_count=u[10] + 1)
+        await update_user(call.from_user.id, dealer_count=u["dealer_count"] + 1)
         text = f"🃏 Ты: {player} | Дилер: {dealer}\n\n🤝 Ничья!"
-
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🃏 Ещё раз", callback_data="dealer")],
     ])
     await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
-
-
-roulette_state = {}
 
 
 @dp.callback_query(F.data == "roulette")
@@ -570,12 +525,10 @@ async def roulette_bet(call: CallbackQuery):
     if not state:
         await call.answer("Сначала выбери цвет", show_alert=True)
         return
-
     u = await get_user(call.from_user.id)
-    if u[2] < bet:
+    if u["coins"] < bet:
         await call.answer("Недостаточно монет!", show_alert=True)
         return
-
     roll = random.randint(1, 100)
     if roll <= 45:
         landed = "red"
@@ -583,15 +536,13 @@ async def roulette_bet(call: CallbackQuery):
         landed = "black"
     else:
         landed = "green"
-
     if landed == state["color"]:
         reward = bet * 14 if landed == "green" else bet * 2
-        await update_user(call.from_user.id, coins=u[2] - bet + reward)
+        await update_user(call.from_user.id, coins=u["coins"] - bet + reward)
         text = f"🎡 Выпало: {landed}\n\n🎉 Выигрыш! +{reward} монет"
     else:
-        await update_user(call.from_user.id, coins=u[2] - bet)
+        await update_user(call.from_user.id, coins=u["coins"] - bet)
         text = f"🎡 Выпало: {landed}\n\n😢 Проигрыш. -{bet} монет"
-
     roulette_state.pop(call.from_user.id, None)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎡 Ещё раз", callback_data="roulette")],
@@ -600,13 +551,10 @@ async def roulette_bet(call: CallbackQuery):
     await call.answer()
 
 
-upgrade_state = {}
-
-
 @dp.callback_query(F.data == "upgrade")
 async def upgrade_start(call: CallbackQuery):
     u = await get_user(call.from_user.id)
-    inv = [i for i in u[6].split(",") if i]
+    inv = [i for i in u["inventory"].split(",") if i]
     if not inv:
         await call.answer("Инвентарь пуст!", show_alert=True)
         return
@@ -619,7 +567,7 @@ async def upgrade_start(call: CallbackQuery):
 async def upgrade_pick(call: CallbackQuery):
     idx = int(call.data.split("_")[1])
     u = await get_user(call.from_user.id)
-    inv = [i for i in u[6].split(",") if i]
+    inv = [i for i in u["inventory"].split(",") if i]
     if idx >= len(inv):
         await call.answer("Не найден", show_alert=True)
         return
@@ -643,23 +591,19 @@ async def upgrade_do(call: CallbackQuery):
         return
     chances = {2: 60, 3: 40, 5: 25, 10: 10}
     u = await get_user(call.from_user.id)
-    inv = [i for i in u[6].split(",") if i]
-
+    inv = [i for i in u["inventory"].split(",") if i]
     if random.randint(1, 100) <= chances[mult]:
         reward = 1000 * mult
         inv.pop(state["inv_idx"])
-        await update_user(call.from_user.id, coins=u[2] + reward, inventory=",".join(inv))
+        await update_user(call.from_user.id, coins=u["coins"] + reward, inventory=",".join(inv))
         text = f"🎉 Успех ×{mult}!\n💰 +{reward} монет"
     else:
         inv.pop(state["inv_idx"])
         await update_user(call.from_user.id, inventory=",".join(inv))
         text = f"💥 Провал ×{mult}. Предмет потерян."
-
     upgrade_state.pop(call.from_user.id, None)
     await call.message.edit_text(text)
 
-
-# ================= АДМИН-ПАНЕЛЬ =================
 
 def admin_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -680,26 +624,22 @@ def admin_menu():
 async def admin_panel(message: Message):
     if not is_admin(message.from_user.id):
         return
-    await message.answer("🛠 <b>Админ-панель</b>\nВыбери действие:", reply_markup=admin_menu(), parse_mode="HTML")
+    await message.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_menu(), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "adm_stats")
 async def adm_stats(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("SELECT COUNT(*), SUM(coins), SUM(xp), SUM(cases_opened) FROM users")
-        total, coins, xp, cases = await cur.fetchone()
-        cur = await db.execute("SELECT COUNT(*) FROM users WHERE banned=1")
-        banned = (await cur.fetchone())[0]
-    text = (
-        f"📊 <b>Статистика</b>\n\n"
-        f"👥 Игроков: <b>{total or 0}</b>\n"
-        f"🚫 Забанено: <b>{banned or 0}</b>\n"
-        f"💰 Монет в обороте: <b>{coins or 0}</b>\n"
-        f"✨ Опыта всего: <b>{xp or 0}</b>\n"
-        f"🎁 Кейсов открыто: <b>{cases or 0}</b>"
-    )
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT COUNT(*) as t, SUM(coins) as c, SUM(xp) as x, SUM(cases_opened) as cs FROM users")
+        banned = await conn.fetchval("SELECT COUNT(*) FROM users WHERE banned=1")
+    text = (f"📊 <b>Статистика</b>\n\n"
+            f"👥 Игроков: <b>{row['t'] or 0}</b>\n"
+            f"🚫 Забанено: <b>{banned or 0}</b>\n"
+            f"💰 Монет: <b>{row['c'] or 0}</b>\n"
+            f"✨ Опыта: <b>{row['x'] or 0}</b>\n"
+            f"🎁 Кейсов: <b>{row['cs'] or 0}</b>")
     await call.message.edit_text(text, reply_markup=admin_menu(), parse_mode="HTML")
     await call.answer()
 
@@ -709,10 +649,7 @@ async def adm_broadcast(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return
     broadcast_state["waiting"] = True
-    await call.message.edit_text(
-        "📢 Отправь текст рассылки следующим сообщением.\n\n"
-        "Чтобы отменить — напиши /cancel"
-    )
+    await call.message.edit_text("📢 Отправь текст рассылки.\n/cancel — отмена")
     await call.answer()
 
 
@@ -721,41 +658,32 @@ async def cancel_broadcast(message: Message):
     if not is_admin(message.from_user.id):
         return
     broadcast_state["waiting"] = False
-    await message.answer("❌ Рассылка отменена.")
+    await message.answer("❌ Отменено.")
 
 
 @dp.message(F.text)
 async def handle_broadcast(message: Message):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not broadcast_state["waiting"]:
         return
-    if not broadcast_state["waiting"]:
-        return
-
     broadcast_state["waiting"] = False
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("SELECT user_id FROM users WHERE banned=0")
-        rows = await cur.fetchall()
-
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users WHERE banned=0")
     sent, failed = 0, 0
-    for (uid,) in rows:
+    for r in rows:
         try:
-            await bot.send_message(uid, message.text)
+            await bot.send_message(r["user_id"], message.text)
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
             failed += 1
-
-    await message.answer(f"📢 Рассылка завершена!\n\n✅ Доставлено: {sent}\n❌ Ошибок: {failed}")
+    await message.answer(f"📢 Готово!\n✅ {sent}\n❌ {failed}")
 
 
 @dp.callback_query(F.data == "adm_give")
 async def adm_give(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return
-    await call.message.edit_text(
-        "💰 Отправь: <code>give 123456789 1000</code>",
-        parse_mode="HTML"
-    )
+    await call.message.edit_text("💰 <code>give 123456789 1000</code>", parse_mode="HTML")
     await call.answer()
 
 
@@ -770,15 +698,15 @@ async def adm_give_exec(message: Message):
         await message.answer("❌ Формат: give 123456789 1000")
         return
     u = await get_user(uid)
-    await update_user(uid, coins=u[2] + amount)
-    await message.answer(f"✅ Выдано {amount} монет игроку {uid}.")
+    await update_user(uid, coins=u["coins"] + amount)
+    await message.answer(f"✅ +{amount} монет игроку {uid}.")
 
 
 @dp.callback_query(F.data == "adm_take")
 async def adm_take(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return
-    await call.message.edit_text("💸 Отправь: <code>take 123456789 1000</code>", parse_mode="HTML")
+    await call.message.edit_text("💸 <code>take 123456789 1000</code>", parse_mode="HTML")
     await call.answer()
 
 
@@ -793,16 +721,16 @@ async def adm_take_exec(message: Message):
         await message.answer("❌ Формат: take 123456789 1000")
         return
     u = await get_user(uid)
-    new = max(0, u[2] - amount)
+    new = max(0, u["coins"] - amount)
     await update_user(uid, coins=new)
-    await message.answer(f"✅ Забрано {amount} монет у {uid}. Баланс: {new}")
+    await message.answer(f"✅ -{amount}. Баланс: {new}")
 
 
 @dp.callback_query(F.data == "adm_setxp")
 async def adm_setxp(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return
-    await call.message.edit_text("✨ Отправь: <code>setxp 123456789 500</code>", parse_mode="HTML")
+    await call.message.edit_text("✨ <code>setxp 123456789 500</code>", parse_mode="HTML")
     await call.answer()
 
 
@@ -818,14 +746,14 @@ async def adm_setxp_exec(message: Message):
         return
     await get_user(uid)
     await update_user(uid, xp=amount)
-    await message.answer(f"✅ XP игрока {uid} = {amount}.")
+    await message.answer(f"✅ XP = {amount}.")
 
 
 @dp.callback_query(F.data == "adm_crystals")
 async def adm_crystals(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return
-    await call.message.edit_text("💎 Отправь: <code>crystal 123456789 5</code>", parse_mode="HTML")
+    await call.message.edit_text("💎 <code>crystal 123456789 5</code>", parse_mode="HTML")
     await call.answer()
 
 
@@ -840,15 +768,15 @@ async def adm_crystal_exec(message: Message):
         await message.answer("❌ Формат: crystal 123456789 5")
         return
     u = await get_user(uid)
-    await update_user(uid, crystals=u[15] + amount)
-    await message.answer(f"✅ Выдано {amount} кристаллов игроку {uid}.")
+    await update_user(uid, crystals=u["crystals"] + amount)
+    await message.answer(f"✅ +{amount} кристаллов игроку {uid}.")
 
 
 @dp.callback_query(F.data == "adm_ban")
 async def adm_ban(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return
-    await call.message.edit_text("🚫 Отправь: <code>ban 123456789</code>", parse_mode="HTML")
+    await call.message.edit_text("🚫 <code>ban 123456789</code>", parse_mode="HTML")
     await call.answer()
 
 
@@ -864,14 +792,14 @@ async def adm_ban_exec(message: Message):
         return
     await get_user(uid)
     await update_user(uid, banned=1)
-    await message.answer(f"🚫 Игрок {uid} забанен.")
+    await message.answer(f"🚫 {uid} забанен.")
 
 
 @dp.callback_query(F.data == "adm_unban")
 async def adm_unban(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return
-    await call.message.edit_text("✅ Отправь: <code>unban 123456789</code>", parse_mode="HTML")
+    await call.message.edit_text("✅ <code>unban 123456789</code>", parse_mode="HTML")
     await call.answer()
 
 
@@ -887,17 +815,14 @@ async def adm_unban_exec(message: Message):
         return
     await get_user(uid)
     await update_user(uid, banned=0)
-    await message.answer(f"✅ Игрок {uid} разбанен.")
+    await message.answer(f"✅ {uid} разбанен.")
 
 
 @dp.callback_query(F.data == "adm_giveitem")
 async def adm_giveitem(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return
-    await call.message.edit_text(
-        "🎁 Отправь: <code>item 123456789 🎩 Цилиндр</code>",
-        parse_mode="HTML"
-    )
+    await call.message.edit_text("🎁 <code>item 123456789 🎩 Цилиндр</code>", parse_mode="HTML")
     await call.answer()
 
 
@@ -913,26 +838,16 @@ async def adm_giveitem_exec(message: Message):
         uid = int(parts[1])
         item = parts[2]
     except Exception:
-        await message.answer("❌ Формат: item 123456789 🎩 Цилиндр")
+        await message.answer("❌ Формат неверный")
         return
     u = await get_user(uid)
-    inv = [i for i in u[6].split(",") if i]
+    inv = [i for i in u["inventory"].split(",") if i]
     inv.append(item)
     await update_user(uid, inventory=",".join(inv))
-    await message.answer(f"✅ Выдан предмет «{item}» игроку {uid}.")
+    await message.answer(f"✅ Выдан «{item}» игроку {uid}.")
 
 
 @dp.callback_query(F.data == "adm_close")
 async def adm_close(call: CallbackQuery):
     await call.message.delete()
     await call.answer()
-
-
-async def main():
-    await init_db()
-    print("Бот запущен!")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
